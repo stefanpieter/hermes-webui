@@ -268,28 +268,31 @@ def test_sigterm_style_shutdown_runs_finally_drain():
 
 
 def test_server_installs_sigterm_handler_and_drains_in_finally():
-    """server.py must wire a SIGTERM handler and drain in serve_forever's finally."""
-    src = (REPO / "server.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    """Server startup must wire SIGTERM and drain in serve_forever's finally."""
+    server_src = (REPO / "server.py").read_text(encoding="utf-8")
+    lifecycle_src = (REPO / "api" / "lifecycle.py").read_text(encoding="utf-8")
+    lifecycle_tree = ast.parse(lifecycle_src)
 
-    # A SIGTERM handler is installed via signal.signal(signal.SIGTERM, ...).
+    # The extracted lifecycle helper installs SIGTERM explicitly.
     installs_sigterm = any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "signal"
         and node.args
         and ast.dump(node.args[0]).find("SIGTERM") != -1
-        for node in ast.walk(tree)
+        for node in ast.walk(lifecycle_tree)
     )
-    assert installs_sigterm, "server.py does not install a SIGTERM handler"
+    assert installs_sigterm, "api/lifecycle.py does not install a SIGTERM handler"
 
+    # Server startup calls the lifecycle installer before serve_forever().
+    assert "_install_lifecycle_signal_handlers(httpd)" in server_src
     # httpd.shutdown() is dispatched (from a helper thread) rather than the
     # default SIGTERM behavior that would skip the finally.
-    assert "httpd.shutdown" in src
+    assert "httpd.shutdown" in lifecycle_src
     # The existing shutdown drain is still wired.
-    assert "drain_all_on_shutdown" in src
+    assert "drain_all_on_shutdown" in server_src
     # SIGPIPE handling must be preserved.
-    assert "SIGPIPE" in src
+    assert "SIGPIPE" in server_src
 
 
 # --------------------------------------------------------------------------- #

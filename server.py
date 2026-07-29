@@ -4,12 +4,12 @@ import os
 import re
 import signal
 import socket
+import ssl
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 def _ignore_sigpipe() -> None:
     """Keep broken client writes from terminating the server process."""
@@ -108,6 +108,11 @@ from api.helpers import (
     _build_csp_report_only_policy,
     _CLIENT_DISCONNECT_ERRORS,
 )
+from api.lifecycle import (
+    install_lifecycle_signal_handlers as _install_lifecycle_signal_handlers,
+    reject_if_draining,
+    track_active_request,
+)
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers
 from api.startup import auto_install_agent_deps, fix_credential_permissions
@@ -142,7 +147,7 @@ class QuietHTTPServer(ThreadingHTTPServer):
         self._active_requests_lock = threading.Lock()
         self.draining = False
         self.drain_started_at = 0.0
-        self.drain_signal_supported = hasattr(signal, 'SIGUSR2')
+        self.drain_signal_supported = False
 
     def server_bind(self):
         if sys.platform == 'win32':
@@ -377,32 +382,8 @@ class Handler(BaseHTTPRequestHandler):
         record = _json.dumps(record_data)
         self._safe_webui_print(f'[webui] {record}')
 
-    @contextmanager
-    def _track_active_request(self):
-        server = getattr(self, 'server', None)
-        lock = getattr(server, '_active_requests_lock', None)
-        if server is not None and lock is not None:
-            with lock:
-                server.active_requests_inflight = int(getattr(server, 'active_requests_inflight', 0) or 0) + 1
-        try:
-            yield
-        finally:
-            if server is not None and lock is not None:
-                with lock:
-                    server.active_requests_inflight = max(
-                        0,
-                        int(getattr(server, 'active_requests_inflight', 0) or 0) - 1,
-                    )
-
-    def _reject_if_draining(self, parsed) -> bool:
-        server = getattr(self, 'server', None)
-        if not bool(getattr(server, 'draining', False)):
-            return False
-        if getattr(parsed, 'path', '') == '/health':
-            return False
-        self.close_connection = True
-        j(self, {'error': 'Hermes WebUI is draining for a protected Agent update. Retry shortly.'}, status=503)
-        return True
+    _track_active_request = track_active_request
+    _reject_if_draining = reject_if_draining
 
     def do_GET(self) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
@@ -410,8 +391,8 @@ class Handler(BaseHTTPRequestHandler):
         if cookie_profile:
             set_request_profile(cookie_profile)
         try:
-            with self._track_active_request():
-                parsed = urlparse(self.path)
+            parsed = urlparse(self.path)
+            with self._track_active_request(count=parsed.path != '/health'):
                 if self._reject_if_draining(parsed):
                     return
                 if not check_auth(self, parsed): return
@@ -475,9 +456,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
-        with self._track_active_request():
+        with track_active_request(self):
             parsed = urlparse(self.path)
-            if self._reject_if_draining(parsed):
+            if reject_if_draining(self, parsed):
                 return
             self.send_response(200)
             apply_cors_preflight_headers(self)
@@ -585,40 +566,6 @@ def _abort_if_already_serving(host: str, port: int) -> None:
                 sys.exit(1)
     except (ConnectionRefusedError, ConnectionResetError, OSError, socket.timeout):
         pass
-
-
-def _install_lifecycle_signal_handlers(httpd, *, logger=logger) -> None:
-    """Install orderly shutdown and drain lifecycle handlers for the WebUI server."""
-    shutdown_requested = threading.Event()
-
-    def _request_shutdown(signum, _frame):
-        if shutdown_requested.is_set():
-            return
-        shutdown_requested.set()
-        threading.Thread(
-            target=httpd.shutdown,
-            name="webui-sigterm-shutdown",
-            daemon=True,
-        ).start()
-
-    def _request_drain(_signum, _frame):
-        if getattr(httpd, 'draining', False):
-            return
-        httpd.draining = True
-        httpd.drain_started_at = time.time()
-        logger.info("[drain] admission fence enabled for protected Agent update")
-
-    try:
-        signal.signal(signal.SIGTERM, _request_shutdown)
-        signal.signal(signal.SIGINT, _request_shutdown)
-        if hasattr(signal, 'SIGUSR2'):
-            signal.signal(signal.SIGUSR2, _request_drain)
-            httpd.drain_signal_supported = True
-        else:
-            httpd.drain_signal_supported = False
-    except (ValueError, OSError):
-        # Not on the main thread (e.g. embedded/test harness); skip handler.
-        logger.debug("Could not install lifecycle signal handlers", exc_info=True)
 
 
 def main() -> None:
