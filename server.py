@@ -6,7 +6,6 @@ import signal
 import socket
 import ssl
 import sys
-import tempfile
 import threading
 import time
 import traceback
