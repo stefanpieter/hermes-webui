@@ -13022,6 +13022,7 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             limited_effective_base_offset = 0
+            _session_tool_call_window_offset = 0
             if load_messages:
                 if (
                     msg_limit is not None
@@ -13043,6 +13044,23 @@ def handle_get(handler, parsed) -> bool:
                     msg_before=msg_before,
                     expand_renderable=expand_renderable,
                 )
+                # Session-level tool-call and anchor-scene indices are relative
+                # to the direct session segment (``s.messages``), while
+                # ``_all_msgs`` may be a fully stitched parent+child lineage.
+                # Translate the display window into that child-local coordinate
+                # space before exposing a lineage-global pagination cursor.
+                _direct_session_messages = list(getattr(s, "messages", []) or [])
+                _session_message_base_offset = (
+                    _loaded_prefix_count_before_sidecar(
+                        _all_msgs,
+                        _direct_session_messages,
+                    )
+                    if _direct_session_messages
+                    else 0
+                )
+                _session_tool_call_window_offset = (
+                    _messages_offset - _session_message_base_offset
+                )
                 if limited_effective_base_offset:
                     _messages_offset += limited_effective_base_offset
                 if msg_limit is not None:
@@ -13050,7 +13068,7 @@ def handle_get(handler, parsed) -> bool:
                 _truncated_msgs = _hydrate_anchor_activity_scenes(
                     _truncated_msgs,
                     getattr(s, "anchor_activity_scenes", None),
-                    message_offset=_messages_offset,
+                    message_offset=_session_tool_call_window_offset,
                     tool_calls=getattr(s, "tool_calls", None),
                 )
             else:
@@ -13128,7 +13146,7 @@ def handle_get(handler, parsed) -> bool:
             if _windowed_messages:
                 _session_tool_calls = _tool_calls_for_message_window(
                     _session_tool_calls,
-                    _messages_offset,
+                    _session_tool_call_window_offset,
                     len(_truncated_msgs),
                 )
             _merged_message_count = (
