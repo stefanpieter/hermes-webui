@@ -184,6 +184,16 @@ thread. The Handler class subclasses BaseHTTPRequestHandler with two methods:
 
 Routing is a flat if/elif chain inside each method. No routing framework.
 
+Operational lifecycle: SIGTERM/SIGINT request an orderly shutdown so the existing
+`serve_forever()` finally-block can drain background state cleanly. SIGUSR2 is a
+maintenance-only admission fence used by the protected Hermes Agent update workflow:
+it flips the server into `draining` mode, rejects new non-`/health` requests with
+HTTP 503, and keeps `/health` observable so operators can wait for `active_requests`,
+`active_runs`, and `active_streams` to reach zero before unloading the service. Health
+probes are excluded from `active_requests`, so the zero-request drain condition remains
+observable through `/health` itself. The `/health` payload therefore also exposes
+`active_requests`, `draining`, and `drain_signal_supported` as runtime coordination fields.
+
 Helper functions used by all handlers:
 
     j(handler, payload, status=200)     Sends JSON response with correct headers

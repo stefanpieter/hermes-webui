@@ -107,6 +107,11 @@ from api.helpers import (
     _build_csp_report_only_policy,
     _CLIENT_DISCONNECT_ERRORS,
 )
+from api.lifecycle import (
+    install_lifecycle_signal_handlers as _install_lifecycle_signal_handlers,
+    reject_if_draining,
+    track_active_request,
+)
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers
 from api.startup import auto_install_agent_deps, fix_credential_permissions
@@ -137,6 +142,11 @@ class QuietHTTPServer(ThreadingHTTPServer):
         self._overflow_reject_slots = threading.BoundedSemaphore(self.max_overflow_reject_workers)
         self.accept_loop_requests_total = 0
         self.accept_loop_last_request_at = 0.0
+        self.active_requests_inflight = 0
+        self._active_requests_lock = threading.Lock()
+        self.draining = False
+        self.drain_started_at = 0.0
+        self.drain_signal_supported = False
 
     def server_bind(self):
         if sys.platform == 'win32':
@@ -371,6 +381,9 @@ class Handler(BaseHTTPRequestHandler):
         record = _json.dumps(record_data)
         self._safe_webui_print(f'[webui] {record}')
 
+    _track_active_request = track_active_request
+    _reject_if_draining = reject_if_draining
+
     def do_GET(self) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
         cookie_profile = get_profile_cookie(self)
@@ -378,10 +391,13 @@ class Handler(BaseHTTPRequestHandler):
             set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
-            if not check_auth(self, parsed): return
-            result = handle_get(self, parsed)
-            if result is False:
-                return j(self, {'error': 'not found'}, status=404)
+            with self._track_active_request(count=parsed.path != '/health'):
+                if self._reject_if_draining(parsed):
+                    return
+                if not check_auth(self, parsed): return
+                result = handle_get(self, parsed)
+                if result is False:
+                    return j(self, {'error': 'not found'}, status=404)
         except _CLIENT_DISCONNECT_ERRORS:
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
@@ -402,14 +418,17 @@ class Handler(BaseHTTPRequestHandler):
         if cookie_profile:
             set_request_profile(cookie_profile)
         try:
-            parsed = urlparse(self.path)
-            _is_csp_report_post = (
-                parsed.path == "/api/csp-report" and self.command == "POST"
-            )
-            if not _is_csp_report_post and not check_auth(self, parsed): return
-            result = route_func(self, parsed)
-            if result is False:
-                return j(self, {'error': 'not found'}, status=404)
+            with self._track_active_request():
+                parsed = urlparse(self.path)
+                if self._reject_if_draining(parsed):
+                    return
+                _is_csp_report_post = (
+                    parsed.path == "/api/csp-report" and self.command == "POST"
+                )
+                if not _is_csp_report_post and not check_auth(self, parsed): return
+                result = route_func(self, parsed)
+                if result is False:
+                    return j(self, {'error': 'not found'}, status=404)
         except _CLIENT_DISCONNECT_ERRORS:
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
@@ -436,12 +455,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
-        self.send_response(200)
-        apply_cors_preflight_headers(self)
-        # Frame the empty preflight: without Content-Length an HTTP/1.1 keep-alive
-        # 200 is read-until-close, hanging the client until the 30s timeout.
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        with track_active_request(self):
+            parsed = urlparse(self.path)
+            if reject_if_draining(self, parsed):
+                return
+            self.send_response(200)
+            apply_cors_preflight_headers(self)
+            # Frame the empty preflight: without Content-Length an HTTP/1.1 keep-alive
+            # 200 is read-until-close, hanging the client until the 30s timeout.
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def do_DELETE(self) -> None:
         self._handle_write(handle_delete)
@@ -691,34 +714,7 @@ def main() -> None:
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
 
-    # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
-    # terminates the process WITHOUT unwinding the try/finally around
-    # serve_forever(), so drain_all_on_shutdown() (which flushes in-flight
-    # fire-and-forget memory commits) would never run on the normal managed
-    # stop. Install a handler that requests an orderly shutdown so
-    # serve_forever() returns and the existing `finally` block drains cleanly.
-    #
-    # httpd.shutdown() blocks until serve_forever() has exited and MUST NOT be
-    # called from the thread running serve_forever() (it would deadlock), so we
-    # dispatch it from a short-lived helper thread. The handler is idempotent
-    # and guards against double-shutdown (e.g. repeated SIGTERM/SIGINT).
-    _shutdown_requested = threading.Event()
-
-    def _request_shutdown(signum, _frame):
-        if _shutdown_requested.is_set():
-            return
-        _shutdown_requested.set()
-        threading.Thread(
-            target=httpd.shutdown,
-            name="webui-sigterm-shutdown",
-            daemon=True,
-        ).start()
-
-    try:
-        signal.signal(signal.SIGTERM, _request_shutdown)
-    except (ValueError, OSError):
-        # Not on the main thread (e.g. embedded/test harness); skip handler.
-        logger.debug("Could not install SIGTERM handler", exc_info=True)
+    _install_lifecycle_signal_handlers(httpd)
 
     try:
         httpd.serve_forever()

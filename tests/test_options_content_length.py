@@ -25,6 +25,7 @@ class _OptionsHandler:
     def __init__(self, headers=None):
         self.headers = _FakeHeaders(headers or {})
         self.client_address = ("127.0.0.1", 12345)
+        self.path = "/"
         self.status = None
         self.order = []
 
